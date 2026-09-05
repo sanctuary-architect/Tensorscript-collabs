@@ -98,7 +98,7 @@ class Transpiler:
 
     # ---------------- model ----------------
 
-    def emit_model_loader(self, model_name, checkpoint_override_var=None, indent="") -> str:
+    def emit_model_loader(self, model_name, checkpoint_override_var=None, indent="", profile=None) -> str:
         model = self.models[model_name]
         f = model["fields"]
         base = f["base"]
@@ -107,30 +107,39 @@ class Transpiler:
         if checkpoint_override_var:
             lines.append(f"{indent}_base_path = {checkpoint_override_var}")
         elif base["kind"] == "literal":
-            lines.append(f"{indent}_base_path = {py_str(base['value'])}")
+            # strip hf:// / huggingface:// scheme before passing to from_pretrained
+            _v = base["value"]
+            if isinstance(_v, str) and (_v.startswith("hf://") or _v.startswith("huggingface://")):
+                _v = _v.split("//", 1)[1]
+            lines.append(f"{indent}_base_path = {py_str(_v)}")
         elif base["kind"] == "scratch":
             lines.append(f"{indent}_base_path = None  # 'scratch': random init from config, not a pretrained checkpoint")
         elif base["kind"] == "pipeline_ref":
             lines.append(f"{indent}# base resolved at pipeline-orchestration time — see driver script")
             lines.append(f"{indent}_base_path = RESOLVED_BASE_CHECKPOINT")
 
+        is_t4 = (profile or {}).get("profile") == "t4"
         quantize = f.get("quantize", "none")
         if quantize in ("4bit", "8bit"):
             load_in = "load_in_4bit=True" if quantize == "4bit" else "load_in_8bit=True"
-            lines.append(f"{indent}_bnb_config = BitsAndBytesConfig({load_in}, bnb_4bit_compute_dtype=torch.bfloat16)" if quantize == "4bit"
+            compute_dtype = "torch.float16" if is_t4 else "torch.bfloat16"
+            lines.append(f"{indent}_bnb_config = BitsAndBytesConfig({load_in}, bnb_4bit_compute_dtype={compute_dtype})" if quantize == "4bit"
                           else f"{indent}_bnb_config = BitsAndBytesConfig({load_in})")
             quant_kwarg = "quantization_config=_bnb_config"
         else:
             quant_kwarg = None
 
         if base["kind"] == "scratch":
-            lines.append(f"{indent}config = AutoConfig.from_pretrained({py_str(model_name)}_config.json) if os.path.exists({py_str(model_name)}_config.json) else AutoConfig()")
+            lines.append(f"{indent}config = AutoConfig.from_pretrained({py_str(model_name)}_config.json) if os.path.exists({py_str(model_name)}_config.json) else AutoConfig.for_model('gpt2')")
             lines.append(f"{indent}model = AutoModelForCausalLM.from_config(config)")
         else:
             kwargs = ["_base_path"]
             if quant_kwarg:
                 kwargs.append(quant_kwarg)
             kwargs.append("device_map='auto'")
+            if is_t4:
+                kwargs.append("torch_dtype=torch.float16")
+                kwargs.append("attn_implementation='eager'")
             lines.append(f"{indent}model = AutoModelForCausalLM.from_pretrained({', '.join(kwargs)})")
 
         if "freeze" in f:
@@ -370,18 +379,25 @@ class Transpiler:
             "output_dir=OUTPUT_DIR",
             f"num_train_epochs={epochs}",
             f"learning_rate={max_lr}",
-            f"warmup_ratio={warmup}",
+            f"warmup_steps={int(float(warmup) * 2000)}",  # transformers 5.x dropped warmup_ratio
             "lr_scheduler_type='cosine'",
             f"save_strategy={py_str(save_strategy)}",
             f"save_steps={checkpoint_steps}" if save_strategy == "steps" else None,
             f"report_to=[{report_to}]" if report_to != "'none'" else "report_to=[]",
             "seed=SEED",
         ]
+        is_t4 = (f.get("hardware") or {}).get("profile") == "t4"
+        if is_t4:
+            ta_kwargs.append("per_device_train_batch_size=1")
+            ta_kwargs.append("per_device_eval_batch_size=1")
+            ta_kwargs.append("gradient_checkpointing=True")
+            ta_kwargs.append("bf16=False")
+            ta_kwargs.append("fp16=True")
         if metric_for_best:
             ta_kwargs.append("load_best_model_at_end=True")
             ta_kwargs.append(f"metric_for_best_model={py_str(metric_for_best)}")
             ta_kwargs.append(f"greater_is_better={greater_is_better}")
-            ta_kwargs.append("evaluation_strategy=" + py_str(save_strategy))
+            ta_kwargs.append("eval_strategy=" + py_str(save_strategy))
 
         ta_kwargs = [k for k in ta_kwargs if k]
         lines.append(f"{indent}training_args = TrainingArguments(")
@@ -447,7 +463,9 @@ if tokenizer is not None and tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 def _tokenize_fn(batch):
-    return tokenizer(batch.get("text", batch.get("chosen", [""])), truncation=True, max_length=SEQUENCE_LENGTH, padding="max_length")
+    out = tokenizer(batch.get("text", batch.get("chosen", [""])), truncation=True, max_length=SEQUENCE_LENGTH, padding="max_length")
+    out["labels"] = out["input_ids"].copy()
+    return out
 
 if tokenizer is not None:
     train_dataset = train_dataset.map(_tokenize_fn, batched=True)
@@ -455,7 +473,7 @@ if tokenizer is not None:
         eval_dataset = eval_dataset.map(_tokenize_fn, batched=True)
 
 # ---- model ----
-{self.emit_model_loader(model_ref, checkpoint_override_var="RESOLVED_BASE_CHECKPOINT" if checkpoint_override_var else None)}
+{self.emit_model_loader(model_ref, checkpoint_override_var="RESOLVED_BASE_CHECKPOINT" if checkpoint_override_var else None, profile=f.get("hardware"))}
 
 {guardrail_code}
 
